@@ -1,5 +1,5 @@
 """
-Script Name: indexer.py
+Script Name: index_manuals.py
 
 This script extracts text from a collection of Porsche 996 PDF manuals, 
 cleans the text, and indexes it into a DuckDB database configured via config.yaml.

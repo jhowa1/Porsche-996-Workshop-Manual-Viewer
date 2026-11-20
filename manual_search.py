@@ -1,19 +1,17 @@
 """
-Script Name: search_viewer_gui.py
+Script Name: manual_search.py
 
 This module provides a graphical user interface (GUI) to search a database index 
-of PDF manuals, display specific pages, navigate pages, and print them. It uses a 
-config.yaml file for database connection settings and supports DuckDB, SQLite, and SQL Server.
+of PDF manuals, display specific pages, navigate pages, and print them. 
+Supports DuckDB, SQLite, and SQL Server via global configuration variables.
 """
 
 import sys
 import os
 import re
-import yaml
 import fitz  # PyMuPDF
 import logging
 import traceback
-from typing import Dict, Any, Optional
 
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 
@@ -26,92 +24,88 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QKeySequence, QShortcut
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 
-# Setup logging for the connection builder
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-MANUAL_PATH = r"c:/Users/jwhow/Documents/Porsche/shop manual/"
+
+# --- Global Configuration ---
+MANUAL_PATH = r"."
+
+# Database settings: set DB_TYPE to "duckdb", "sqlite", or "odbc" (SQL Server)
+DB_TYPE = "duckdb"
+DB_DATABASE = "manual_index.duckdb"  # File path for DuckDB/SQLite, or DB name for SQL Server
+
+# SQL Server (ODBC) settings — only used if DB_TYPE = "odbc"
+DB_SERVER = "YOUR_SERVER_NAME"
+DB_INSTANCE = ""
+DB_PORT = "1433"
+DB_DRIVER = "ODBC Driver 18 for SQL Server"
+DB_TRUST_SERVER_CERTIFICATE = True
+
 
 # --- Database Connection Helpers ---
 
-def load_config(config_file: str = "config.yaml") -> Dict[str, Any]:
-    if not os.path.exists(MANUAL_PATH):
-        raise FileNotFoundError(f"Configuration file not found: {MANUAL_PATH}")
-    
-    os.chdir(MANUAL_PATH)
-    filepath = os.path.join(MANUAL_PATH, config_file)
-    with open(filepath, 'r') as file:
-        return yaml.safe_load(file)
-
-def _build_odbc_conn_str(sql_cfg: Dict[str, Any]) -> str:
+def _build_odbc_conn_str() -> str:
     """Builds the ODBC connection string for SQL Server connections."""
-    server = (sql_cfg.get("server") or sql_cfg.get("host") or "").strip()
-    instance = (sql_cfg.get("instance") or "").strip()
-    port = str(sql_cfg.get("port") or "").strip()
-    database = (
-        sql_cfg.get("database") or sql_cfg.get("db") or sql_cfg.get("dbname") or ""
-    ).strip()
+    server = DB_SERVER.strip()
+    instance = DB_INSTANCE.strip()
+    port = str(DB_PORT).strip()
+    database = DB_DATABASE.strip()
 
     if not server or not database:
-        raise ValueError("SQL config requires 'server' and 'database'.")
+        raise ValueError("SQL config requires DB_SERVER and DB_DATABASE.")
 
-    driver = sql_cfg.get("driver") or sql_cfg.get("odbc_driver") or "ODBC Driver 18 for SQL Server"
-    
+    driver = DB_DRIVER.strip() or "ODBC Driver 18 for SQL Server"
     if not driver.startswith("{"):
         driver = "{" + driver
     if not driver.endswith("}"):
         driver = driver + "}"
 
     if instance:
-        server_str = "%s\\%s" % (server, instance)
+        server_str = f"{server}\\{instance}"
     elif port:
-        server_str = "%s,%s" % (server, port)
+        server_str = f"{server},{port}"
     else:
         server_str = server
 
+    tsc = "yes" if DB_TRUST_SERVER_CERTIFICATE else "no"
     parts = [
-        "DRIVER=%s" % driver,
-        "SERVER=%s" % server_str,
-        "DATABASE=%s" % database,
+        f"DRIVER={driver}",
+        f"SERVER={server_str}",
+        f"DATABASE={database}",
         "trusted_connection=yes",
+        f"trustservercertificate={tsc}",
     ]
-
-    tsc = sql_cfg.get("trust_server_certificate", True)
-    parts.append(
-        "trustservercertificate=%s"
-        % ("yes" if str(tsc).lower() in ("1", "true", "yes", "y", "on") else "no")
-    )
 
     conn_str = ";".join(parts) + ";"
     logger.debug("ODBC conn str (trusted): %s", conn_str)
     return conn_str
 
-def get_db_connection(config: Optional[Dict[str, Any]] = None):
+
+def get_db_connection():
     """
     Factory function to return a DB-API 2.0 compliant connection.
-    Supports duckdb, sqlite, and odbc (SQL Server) based on config.yaml.
+    Supports duckdb, sqlite, and odbc (SQL Server) via global variables.
     """
-    cfg = config or load_config("config.yaml")
-    sql_cfg = cfg.get("sql") or {}
-    
-    db_type = sql_cfg.get("type", "odbc").lower()
-    
+    db_type = DB_TYPE.strip().lower()
+
     if db_type == "duckdb":
         import duckdb
-        db_path = sql_cfg.get("database", "manual_index.duckdb")
+        db_path = os.path.join(MANUAL_PATH, DB_DATABASE)
         return duckdb.connect(database=db_path)
-        
+
     elif db_type == "sqlite":
         import sqlite3
-        db_path = sql_cfg.get("database", "manual_index.db")
+        db_path = os.path.join(MANUAL_PATH, DB_DATABASE)
         return sqlite3.connect(db_path)
-        
+
     elif db_type == "odbc":
         import pyodbc
-        conn_str = _build_odbc_conn_str(sql_cfg)
+        conn_str = _build_odbc_conn_str()
         return pyodbc.connect(conn_str)
-        
+
     else:
-        raise ValueError(f"Unsupported database type: {db_type}. Use 'duckdb', 'sqlite', or 'odbc'.")
+        raise ValueError(f"Unsupported DB_TYPE: {db_type}. Use 'duckdb', 'sqlite', or 'odbc'.")
 
 
 # --- GUI Application ---
@@ -125,7 +119,7 @@ class ManualSearchViewer(QMainWindow):
         self.conn = None
         self.cursor = None
         self.current_pixmap = None
-        
+
         # State tracking for navigation
         self.current_pdf_path = None
         self.current_page_num = -1
@@ -174,7 +168,7 @@ class ManualSearchViewer(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["Manual File", "Page", "Snippet"])
-        
+
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -186,7 +180,7 @@ class ManualSearchViewer(QMainWindow):
 
         # Bottom Buttons
         btn_layout = QHBoxLayout()
-        
+
         self.btn_prev = QPushButton("<< Prev Page")
         self.btn_prev.clicked.connect(self.prev_page)
         self.btn_prev.setEnabled(False)
@@ -194,7 +188,7 @@ class ManualSearchViewer(QMainWindow):
         self.btn_next = QPushButton("Next Page >>")
         self.btn_next.clicked.connect(self.next_page)
         self.btn_next.setEnabled(False)
-        
+
         self.btn_print = QPushButton("Print (Ctrl+P)")
         self.btn_print.clicked.connect(self.print_page)
         self.btn_print.setEnabled(False)
@@ -226,8 +220,6 @@ class ManualSearchViewer(QMainWindow):
             QMessageBox.critical(self, "Database Error", f"Could not connect to Database:\n{str(e)}")
 
     def execute_search(self):
-        import re
-
         if not self.cursor:
             return
 
@@ -237,43 +229,41 @@ class ManualSearchViewer(QMainWindow):
 
         try:
             self.table.setRowCount(0)
-            
-            # Split the query into individual words for compound searching
+
+            # Split the query into individual words for case-insensitive compound searching
             search_words = query.split()
-            
-            # Build dynamic SQL with an AND condition for each word
-            like_clauses = " AND ".join(["content LIKE ?"] * len(search_words))
+
+            # Use LOWER(content) LIKE ? for portable case-insensitive matching across all SQL engines
+            like_clauses = " AND ".join(["LOWER(content) LIKE ?"] * len(search_words))
             sql = f'''
                 SELECT filename, page_number, content 
                 FROM manual_index 
                 WHERE {like_clauses}
             '''
-            
-            # Create the parameter tuple
-            params = tuple(f"%{word}%" for word in search_words)
-            
+
+            params = tuple(f"%{word.lower()}%" for word in search_words)
+
             self.cursor.execute(sql, params)
             rows = self.cursor.fetchall()
-            
-            # Build a regex pattern to find the first occurrence of ANY of the search words
+
+            # Build a case-insensitive regex pattern to find the first occurrence of ANY search word
             escaped_words = [re.escape(w) for w in search_words]
             words_or_pattern = "|".join(escaped_words)
             pattern = re.compile(rf'((?:\S+\s+){{0,3}})({words_or_pattern})((?:\s+\S+){{0,15}})', re.IGNORECASE)
-            
+
             for row_idx, row_data in enumerate(rows):
                 self.table.insertRow(row_idx)
                 self.table.setItem(row_idx, 0, QTableWidgetItem(str(row_data[0])))
                 self.table.setItem(row_idx, 1, QTableWidgetItem(str(row_data[1])))
-                
+
                 full_text = str(row_data[2]).replace('\n', ' ')
-                
-                # Extract the targeted snippet around the first matched word
+
                 match = pattern.search(full_text)
                 if match:
                     snippet = "".join(match.groups()).strip()
                 else:
-                    snippet = " ".join(search_words) 
-                
+                    snippet = " ".join(search_words)
+
                 self.table.setItem(row_idx, 2, QTableWidgetItem(f"... {snippet} ..."))
 
             if not rows:
@@ -290,8 +280,8 @@ class ManualSearchViewer(QMainWindow):
             return
 
         self.current_pdf_path = os.path.join(MANUAL_PATH, filename_item.text())
-        self.current_page_num = int(page_item.text()) - 1 
-        
+        self.current_page_num = int(page_item.text()) - 1
+
         self.render_current_page()
 
     def prev_page(self):
@@ -312,14 +302,14 @@ class ManualSearchViewer(QMainWindow):
         try:
             doc = fitz.open(self.current_pdf_path)
             self.total_pages = len(doc)
-            
+
             if self.current_page_num < 0 or self.current_page_num >= self.total_pages:
                 doc.close()
                 return
 
             page = doc.load_page(self.current_page_num)
-            
-            zoom = 2.0 
+
+            zoom = 2.0
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
@@ -330,12 +320,12 @@ class ManualSearchViewer(QMainWindow):
             self.image_label.setMinimumSize(self.current_pixmap.size())
             self.image_label.resize(self.current_pixmap.size())
             self.image_label.adjustSize()
-            
+
             # Update button states
             self.btn_print.setEnabled(True)
             self.btn_prev.setEnabled(self.current_page_num > 0)
             self.btn_next.setEnabled(self.current_page_num < self.total_pages - 1)
-            
+
             doc.close()
 
         except Exception as e:
@@ -369,6 +359,7 @@ class ManualSearchViewer(QMainWindow):
                 pass
         event.accept()
 
+
 def main():
     app = QApplication.instance() or QApplication(sys.argv)
     try:
@@ -379,6 +370,7 @@ def main():
         pass
     except Exception:
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()
